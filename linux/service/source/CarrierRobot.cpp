@@ -581,6 +581,14 @@ namespace chatrobot {
         std::shared_ptr<MemberInfo> agent_member = mDatabaseProxy->getMemberInfo(
                 std::make_shared<std::string>(agent_user_id));
         if (agent_member.get() != nullptr) {
+            // The target is already a group member: no friend request needed,
+            // but the agent registration must still be recorded — returning
+            // without addAgent() reported "Agent registered" while relay kept
+            // sending plain text (agent_table never gained the userid).
+            if (!mDatabaseProxy->addAgent(agent_user_id, address)) {
+                error_message = "failed to persist agent registration";
+                return false;
+            }
             return true;
         }
 
