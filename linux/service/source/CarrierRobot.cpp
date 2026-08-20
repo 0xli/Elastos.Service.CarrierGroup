@@ -32,6 +32,13 @@ namespace chatrobot {
         constexpr const char *kAgentReplyPrefix = "CGR1 ";
         constexpr const char *kAgentStatusPrefix = "CGS1 ";
 
+        // Carrier profile and message data is supplied by remote peers.  Do not
+        // let a malformed byte sequence from one peer terminate the whole group
+        // service while serializing a relay envelope.
+        std::string dumpJsonForTransport(const json &value) {
+            return value.dump(-1, ' ', false, json::error_handler_t::replace);
+        }
+
         std::string trimDisplayName(const std::string &value) {
             size_t begin = 0;
             while (begin < value.size()
@@ -350,7 +357,7 @@ namespace chatrobot {
         msg["cmd"] = Command_UpdateMemberCount;
         msg["friendid"] = mAddress.c_str();
         msg["membercount"] = getFriendList()->size();
-        sendMsgForManager(msg.dump());
+        sendMsgForManager(dumpJsonForTransport(msg));
     }
 
     bool CarrierRobot::relayMessages() {
@@ -530,7 +537,7 @@ namespace chatrobot {
         msg["cmd"] = Command_UpdateAddress;
         msg["serviceid"] = service_id;
         msg["friendid"] = mAddress.c_str();
-        sendMsgForManager(msg.dump());
+        sendMsgForManager(dumpJsonForTransport(msg));
         return 0;
     }
 
@@ -957,7 +964,7 @@ namespace chatrobot {
             } else {
                 normalized["status"]["ts"] = static_cast<long long>(std::time(nullptr));
             }
-            return std::string(kAgentStatusPrefix) + normalized.dump();
+            return std::string(kAgentStatusPrefix) + dumpJsonForTransport(normalized);
         } catch (...) {
             return "";
         }
@@ -1078,7 +1085,7 @@ namespace chatrobot {
         envelope["message"]["text"] = *message->mMsg.get();
         envelope["message"]["timestamp"] = static_cast<long long>(message->mSendTimeStamp);
         envelope["render"]["plain"] = plain_text;
-        return std::string(kAgentOutboundPrefix) + envelope.dump();
+        return std::string(kAgentOutboundPrefix) + dumpJsonForTransport(envelope);
     }
 
     bool CarrierRobot::isGroupCreator(const std::string &friend_id) {
@@ -1150,7 +1157,7 @@ namespace chatrobot {
                 msg["cmd"] =Command_UpdateNickName;
                 msg["friendid"] = mAddress.c_str();
                 msg["nickname"] = nick_name.c_str();
-                sendMsgForManager(msg.dump());
+                sendMsgForManager(dumpJsonForTransport(msg));
             }
         }
     }
@@ -1166,7 +1173,7 @@ namespace chatrobot {
                 msg["friendid"] = mAddress.c_str();
                 msg["my_socket_fd"] = mMySocketFd;
                 msg["status"] = mStatus;
-                sendMsgForManager(msg.dump());
+                sendMsgForManager(dumpJsonForTransport(msg));
                 //好友解除关系
                 std::shared_ptr<std::vector<std::shared_ptr<MemberInfo>>> memberlist = mDatabaseProxy->getFriendList();
                 for (int i = 0; i < memberlist->size(); i++) {
@@ -1221,7 +1228,7 @@ namespace chatrobot {
                 msg["cmd"] = Command_UpdateMemberCount;
                 msg["friendid"] = mAddress.c_str();
                 msg["membercount"] = getFriendList()->size();
-                sendMsgForManager(msg.dump());
+                sendMsgForManager(dumpJsonForTransport(msg));
             }
         }
     }
@@ -1259,7 +1266,7 @@ namespace chatrobot {
                 msg["cmd"] = Command_UpdateMemberCount;
                 msg["friendid"] = mAddress.c_str();
                 msg["membercount"] = getFriendList()->size();
-                sendMsgForManager(msg.dump());
+                sendMsgForManager(dumpJsonForTransport(msg));
             }
         }
     }
