@@ -4,6 +4,7 @@
 
 #include "DatabaseProxy.h"
 #include <algorithm>
+#include <cstring>
 #include <map>
 #include <iostream>
 #include <../../common/Log.hpp>
@@ -747,6 +748,23 @@ namespace chatrobot {
                    "SQLite signer_table statement execution error: %s\n", errMsg);
             return 1;
         }
+        // Messages pulled from Express that were parked before this group
+        // service pulled Express at all (see CarrierRobot::addMessgae): kept,
+        // never relayed. service_meta holds small key/value state.
+        const char *create_backlog_table = "CREATE TABLE IF NOT EXISTS express_backlog_table (id INTEGER PRIMARY KEY AUTOINCREMENT,Friendid TEXT NOT NULL, Msg BLOB, PostTimeStamp INTEGER, RecvTimeStamp INTEGER)";
+        rv = sqlite3_exec(mDb, create_backlog_table, callback, this, &errMsg);
+        if (rv != SQLITE_OK) {
+            Log::I(DatabaseProxy::TAG,
+                   "SQLite express_backlog_table statement execution error: %s\n", errMsg);
+            return 1;
+        }
+        const char *create_meta_table = "CREATE TABLE IF NOT EXISTS service_meta (Key TEXT PRIMARY KEY, Value INTEGER)";
+        rv = sqlite3_exec(mDb, create_meta_table, callback, this, &errMsg);
+        if (rv != SQLITE_OK) {
+            Log::I(DatabaseProxy::TAG,
+                   "SQLite service_meta statement execution error: %s\n", errMsg);
+            return 1;
+        }
         //同步Member信息
         syncMemberList();
         syncGroupInfo();
@@ -754,5 +772,73 @@ namespace chatrobot {
         syncAgentList();
         syncSignerList();
         return 0;
+    }
+
+    std::time_t DatabaseProxy::getOrInitMeta(const std::string &key, std::time_t init_value) {
+        MUTEX_LOCKER locker_sync_data(_SyncedMessageList);
+        sqlite3_stmt *stmt = nullptr;
+        std::time_t value = init_value;
+        bool found = false;
+        if (sqlite3_prepare_v2(mDb, "select Value from service_meta where Key=?;", -1, &stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, key.data(), static_cast<int>(key.size()), SQLITE_TRANSIENT);
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                value = static_cast<std::time_t>(sqlite3_column_int64(stmt, 0));
+                found = true;
+            }
+        }
+        sqlite3_finalize(stmt);
+        if (!found) {
+            stmt = nullptr;
+            if (sqlite3_prepare_v2(mDb, "insert or replace into service_meta values(?, ?);", -1, &stmt, nullptr) == SQLITE_OK) {
+                sqlite3_bind_text(stmt, 1, key.data(), static_cast<int>(key.size()), SQLITE_TRANSIENT);
+                sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(init_value));
+                sqlite3_step(stmt);
+            }
+            sqlite3_finalize(stmt);
+        }
+        return value;
+    }
+
+    bool DatabaseProxy::hasMessageSince(const std::string &friend_id, const std::string &message,
+                                        std::time_t since) {
+        MUTEX_LOCKER locker_sync_data(_SyncedMessageList);
+        sqlite3_stmt *stmt = nullptr;
+        bool found = false;
+        const char *sql = "select Msg from message_table where Friendid=? and SendTimeStamp>=?"
+                          " and length(cast(Msg as blob))=?;";
+        if (sqlite3_prepare_v2(mDb, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            Log::I(TAG, "hasMessageSince prepare error: %s", sqlite3_errmsg(mDb));
+            return false;
+        }
+        sqlite3_bind_text(stmt, 1, friend_id.data(), static_cast<int>(friend_id.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(since));
+        sqlite3_bind_int64(stmt, 3, static_cast<sqlite3_int64>(message.size()));
+        while (!found && sqlite3_step(stmt) == SQLITE_ROW) {
+            const void *msg = sqlite3_column_blob(stmt, 0);
+            const int len = sqlite3_column_bytes(stmt, 0);
+            found = static_cast<size_t>(len) == message.size()
+                    && (len == 0 || memcmp(msg, message.data(), message.size()) == 0);
+        }
+        sqlite3_finalize(stmt);
+        return found;
+    }
+
+    void DatabaseProxy::addExpressBacklog(const std::string &friend_id, const std::string &message,
+                                          std::time_t post_time, std::time_t recv_time) {
+        MUTEX_LOCKER locker_sync_data(_SyncedMessageList);
+        sqlite3_stmt *stmt = nullptr;
+        if (sqlite3_prepare_v2(mDb, "insert into express_backlog_table values(NULL, ?, ?, ?, ?);",
+                               -1, &stmt, nullptr) != SQLITE_OK) {
+            Log::I(TAG, "addExpressBacklog prepare error: %s", sqlite3_errmsg(mDb));
+            return;
+        }
+        sqlite3_bind_text(stmt, 1, friend_id.data(), static_cast<int>(friend_id.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_blob(stmt, 2, message.data(), static_cast<int>(message.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 3, static_cast<sqlite3_int64>(post_time));
+        sqlite3_bind_int64(stmt, 4, static_cast<sqlite3_int64>(recv_time));
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            Log::I(TAG, "addExpressBacklog step error: %s", sqlite3_errmsg(mDb));
+        }
+        sqlite3_finalize(stmt);
     }
 }

@@ -33,6 +33,28 @@ meta = {"type":"file","filename":"voice-<ms>-<durMs>.m4a","contentType":"audio/m
 A DNFT1 frame (`0x1E "DNFT1"`, the 1:1 streamed-transfer handshake) sent to a group
 is dropped. Relayed, it only ever became junk text for every member (2026-10-09).
 
+## Offline copies (Express)
+
+A member whose link to the group is down does not lose the message: its core
+parks it on an Express node (`lens.beagle.chat` first, then
+`express.beagle.chat`). Since 2026-11-03 the group pulls and deletes from both
+nodes (native SDK `e8eb0b0`, `CarrierConfig.cpp`) and handles a pulled message
+like a live one, text and file alike, with two exceptions:
+
+- **Duplicates.** The core re-sends a live message through Express when no
+  receipt comes back in 30 s, so the same message can arrive twice. An Express
+  copy is dropped when the same sender's identical bytes were stored from 10 min
+  before it was posted (at most 24 h back). A real repeat of the same text that
+  was parked in that window is dropped too; that is the trade-off.
+- **Backlog.** Until 2026-11-03 the group never pulled Express, so up to 14 days
+  of parked messages were waiting. Anything posted more than an hour before the
+  group first pulled (`service_meta.express_since_us`) goes to
+  `express_backlog_table` in the group's DB and is not relayed or run as a
+  command. Relaying that backlog later, if wanted, is a separate decision.
+
+The group's own sends get the same fallback: a relay that is not confirmed is
+parked on Express for that member by the core.
+
 ## What a member receives
 
 ```

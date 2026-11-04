@@ -64,7 +64,12 @@ namespace chatrobot {
         void showAddressCmd(const std::vector<std::string> &args);
         void updateMemberInfo(std::shared_ptr<std::string> friendid, std::shared_ptr<std::string> nickname,
                               ElaConnectionStatus status);
-        void addMessgae(std::shared_ptr<std::string> friend_id, std::shared_ptr<std::string> message, std::time_t send_time);
+        // offline: pulled from Express; post_time: the core's timestamp for it.
+        void addMessgae(std::shared_ptr<std::string> friend_id, std::shared_ptr<std::string> message, std::time_t send_time,
+                        bool offline = false, int64_t post_time = 0);
+        // False when an Express copy must not be stored/relayed (duplicate or backlog).
+        bool acceptOfflineCopy(const std::string &friend_id, const std::string &stored_form,
+                               std::time_t recv_time, int64_t post_time);
         std::shared_ptr<std::vector<std::shared_ptr<MemberInfo>>>getFriendList();
         void helpCmd(const std::vector<std::string> &args, const std::string& message);
         void listCmd(const std::vector<std::string> &args);
@@ -115,6 +120,8 @@ namespace chatrobot {
         std::shared_ptr<DatabaseProxy> mDatabaseProxy;
         int mStatus;
         int mMySocketFd;
+        // First time this group pulled Express (us). Parked before it = backlog.
+        std::time_t mExpressSince = 0;
         std::function <void(const std::string)> mCarrierCallBack;
         std::string mAddress;
         void sendMsgForManager(std::string msg);

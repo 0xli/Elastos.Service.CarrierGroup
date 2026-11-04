@@ -40,6 +40,15 @@ If a dependency download fails, see `BUILD-DEPS.md` in the native repo: three
 upstream tarball URLs are dead, and a failed download leaves a 0-byte file that
 is then treated as a valid cache entry.
 
+Since 2026-11-03 the service runs native `e8eb0b0` (0xli
+`feat/agentnet-proto-v2`: Express pull from every node, per-node watermark),
+built in its own worktree `~/devs/agentnet-v2-native-e8eb0b0` with its own
+`dist/`, and the service is built in `build/service-e8` with
+`-DCARRIER_SDK_ROOT=~/devs/agentnet-v2-native-e8eb0b0`. Never reinstall a
+`dist/lib` the running groups have mapped: build a new prefix and switch
+`CARRIER_LIB_DIR`. The SDK's dependency tarballs are read from
+`<sdk>/build/.tarballs`; seed it (hashes in the SDK's `docs/BUILD-DEPS.md`).
+
 ## Stage, then swap
 
 Copy in, then `mv` — never `cp` over the running binary, which fails with
@@ -63,7 +72,7 @@ The service links the SDK you built; the old bundled `.so` files are gone.
 ```ini
 # ~/.config/systemd/user/carriergroup.service.d/override.conf
 [Service]
-Environment=CARRIER_LIB_DIR=/home/beagle/devs/agentnet-v2-native/dist/lib
+Environment=CARRIER_LIB_DIR=/home/beagle/devs/agentnet-v2-native-e8eb0b0/dist/lib
 ```
 
 `startCarrierByServer.sh` exits 1 if `libcarrier.so` is missing there. Check with

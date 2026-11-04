@@ -12,6 +12,10 @@
  *                                             send f1, f2 (2 s apart) once the
  *                                             group is online; record replies
  *   cg_e2e -d DIR -g GROUPID -t 60 -o OUT     just listen
+ *   -x  configure the Express nodes the apps use (lens, express.beagle.chat),
+ *       so offline messages are parked and pulled like on a phone
+ *   -f  send without waiting for the group to be online (5 s after ready),
+ *       which parks the message on Express when -x is set
  *
  * Build (against the SDK the service uses):
  *   cc -O2 -o cg_e2e linux/tools/cg_e2e.c \
@@ -34,7 +38,7 @@
 static const char *g_dir, *g_name, *g_join, *g_group, *g_out;
 static const char *g_sends[MAX_SENDS];
 static int g_nsends, g_sent, g_recv_count;
-static bool g_print_addr, g_ready, g_group_online, g_killed;
+static bool g_print_addr, g_ready, g_group_online, g_killed, g_express, g_force;
 static time_t g_deadline, g_next_send;
 static char g_group_id[CARRIER_MAX_ID_LEN + 1];
 
@@ -78,7 +82,7 @@ static void on_idle(Carrier *w, void *ctx)
         carrier_kill(w);
         return;
     }
-    if (g_ready && g_group_online && g_sent < g_nsends && t >= g_next_send) {
+    if (g_ready && (g_group_online || g_force) && g_sent < g_nsends && t >= g_next_send) {
         size_t len = 0;
         unsigned char *buf = read_file(g_sends[g_sent], &len);
         if (!buf || !len) {
@@ -110,6 +114,8 @@ static void on_ready(Carrier *w, void *ctx)
         return;
     }
     printf("%.3f READY\n", now_s());
+    if (g_force && g_next_send < time(NULL) + 5)
+        g_next_send = time(NULL) + 5;
     if (g_name) {
         CarrierUserInfo ui;
         carrier_get_self_info(w, &ui);
@@ -169,7 +175,7 @@ static void on_friend_message(Carrier *w, const char *from, const void *msg, siz
 int main(int argc, char **argv)
 {
     int opt, seconds = 60;
-    while ((opt = getopt(argc, argv, "d:n:j:g:s:t:o:a")) != -1) {
+    while ((opt = getopt(argc, argv, "d:n:j:g:s:t:o:axf")) != -1) {
         switch (opt) {
         case 'd': g_dir = optarg; break;
         case 'n': g_name = optarg; break;
@@ -179,6 +185,8 @@ int main(int argc, char **argv)
         case 't': seconds = atoi(optarg); break;
         case 'o': g_out = optarg; break;
         case 'a': g_print_addr = true; break;
+        case 'x': g_express = true; break;
+        case 'f': g_force = true; break;
         default: fprintf(stderr, "bad args\n"); return 2;
         }
     }
@@ -206,6 +214,16 @@ int main(int argc, char **argv)
     opts.log_level = CarrierLogLevel_Warning;
     opts.bootstraps = nodes;
     opts.bootstraps_size = sizeof(nodes) / sizeof(nodes[0]);
+
+    /* Same Express nodes as the iOS app (bootstrap.json), lens first. */
+    ExpressNode xnodes[] = {
+        {"lens.beagle.chat", NULL, "443", "ECbs4GxwGzxGerNkmqDJFibEmevu8jAXqAZtikccvD95"},
+        {"express.beagle.chat", NULL, "443", "fhZcWat6TPhKSnnnLtb1w7hsi5xoz9fkh7jJ8j2HrUz"},
+    };
+    if (g_express) {
+        opts.express_nodes = xnodes;
+        opts.express_nodes_size = sizeof(xnodes) / sizeof(xnodes[0]);
+    }
 
     CarrierCallbacks cbs;
     memset(&cbs, 0, sizeof(cbs));

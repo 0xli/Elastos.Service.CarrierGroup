@@ -545,8 +545,51 @@ namespace chatrobot {
         return false;
     }
 
+    namespace {
+        // The core's timestamp for an Express message, as microseconds. The
+        // node stamps it in us; accept s/ms too rather than trust one unit.
+        int64_t normalizeToMicros(int64_t ts) {
+            if (ts <= 0) return 0;
+            if (ts < 100000000000LL) return ts * 1000000LL;      // seconds
+            if (ts < 100000000000000LL) return ts * 1000LL;      // milliseconds
+            return ts;                                           // microseconds
+        }
+    }
+
+    bool CarrierRobot::acceptOfflineCopy(const std::string &friend_id, const std::string &stored_form,
+                                         std::time_t recv_time, int64_t post_time) {
+        constexpr int64_t kMinute = 60LL * 1000000LL;
+        int64_t posted = normalizeToMicros(post_time);
+        if (posted > static_cast<int64_t>(recv_time) + 60 * kMinute) {
+            posted = 0;  // nonsense from the node: judge by arrival only
+        }
+        // Parked before this group pulled Express at all (an hour of slack
+        // for node clocks): delivered weeks late into a busy group it would
+        // only confuse. Kept in express_backlog_table, not relayed.
+        if (posted > 0 && mExpressSince > 0 && posted < static_cast<int64_t>(mExpressSince) - 60 * kMinute) {
+            mDatabaseProxy->addExpressBacklog(friend_id, stored_form, static_cast<std::time_t>(posted), recv_time);
+            Log::I(TAG, "addMessgae express backlog kept, not relayed: from=%s len=%zu posted_us=%lld",
+                   friend_id.c_str(), stored_form.size(), static_cast<long long>(posted));
+            return false;
+        }
+        // The core re-sends a live message through Express when its receipt
+        // does not come back in 30 s, so a message can arrive twice. Same
+        // sender, same bytes, stored since 10 min before it was posted (or
+        // before now, whichever is earlier; at most a day back) = the copy
+        // we already have.
+        int64_t ref = posted > 0 ? std::min<int64_t>(posted, recv_time) : static_cast<int64_t>(recv_time);
+        int64_t since = std::max<int64_t>(ref - 10 * kMinute, static_cast<int64_t>(recv_time) - 24 * 60 * kMinute);
+        if (mDatabaseProxy->hasMessageSince(friend_id, stored_form, static_cast<std::time_t>(since))) {
+            Log::I(TAG, "addMessgae express duplicate dropped: from=%s len=%zu", friend_id.c_str(),
+                   stored_form.size());
+            return false;
+        }
+        return true;
+    }
+
     void CarrierRobot::addMessgae(std::shared_ptr<std::string> friend_id,
-                                  std::shared_ptr<std::string> message, std::time_t send_time) {
+                                  std::shared_ptr<std::string> message, std::time_t send_time,
+                                  bool offline, int64_t post_time) {
         std::string errMsg;
         if (isDnft1Frame(*message.get())) {
             Log::I(TAG, "addMessgae drop DNFT1 frame from=%s len=%zu", friend_id->c_str(),
@@ -556,8 +599,11 @@ namespace chatrobot {
         switch (parseFileMessage(*message.get(), nullptr, nullptr)) {
             case FileMessageKind::File:
                 // Stored and relayed byte for byte; never a command or agent reply.
-                Log::I(TAG, "addMessgae file message from=%s len=%zu", friend_id->c_str(),
-                       message->size());
+                Log::I(TAG, "addMessgae file message from=%s len=%zu offline=%d", friend_id->c_str(),
+                       message->size(), offline ? 1 : 0);
+                if (offline && !acceptOfflineCopy(*friend_id, *message.get(), send_time, post_time)) {
+                    return;
+                }
                 mDatabaseProxy->addMessgae(friend_id, *message.get(), send_time);
                 relayMessages();
                 return;
@@ -578,6 +624,10 @@ namespace chatrobot {
             std::regex_match(msg.substr(0, 37).c_str(), *mMsgReg.get()) == true) {
             msg = msg.substr(38);//包含空格
         }
+        // Checked before commands too: a /command parked weeks ago must not run now.
+        if (offline && !acceptOfflineCopy(*friend_id, msg, send_time, post_time)) {
+            return;
+        }
         std::string pre_cmd = msg + " " + *friend_id.get();//Pretreatment cmd
         int ret = ChatRobotCmd::Do(this, pre_cmd, errMsg);
         if (ret < 0) {
@@ -596,7 +646,8 @@ namespace chatrobot {
                                               const void *msg, size_t len,
                                               int64_t timestamp, bool offline,
                                               void *context) {
-        Log::I(Log::TAG, "OnCarrierFriendMessage from: %s len=%zu", from, len);
+        Log::I(Log::TAG, "OnCarrierFriendMessage from: %s len=%zu offline=%d ts=%lld", from, len,
+               offline ? 1 : 0, static_cast<long long>(timestamp));
         auto carrier_robot = reinterpret_cast<CarrierRobot *>(context);
         // Carrier payloads are not NUL-terminated; take exactly len bytes and drop trailing NULs
         // (fix carried on the live box since 2026-09-14, folded in here). A file message is
@@ -608,7 +659,7 @@ namespace chatrobot {
         std::time_t send_time = carrier_robot->getTimeStamp();
         carrier_robot->addMessgae(std::make_shared<std::string>(from),
                                   std::make_shared<std::string>(text),
-                                  send_time);
+                                  send_time, offline, timestamp);
     }
 
     void CarrierRobot::stop() {
@@ -645,6 +696,21 @@ namespace chatrobot {
         }
         carrierOpts.bootstraps_size = carrierNodeSize;
         carrierOpts.bootstraps = carrierNodeArray;
+
+        size_t expressNodeSize = mCarrierConfig->mExpressNodes.size();
+        std::vector<ExpressNode> expressNodeArray(expressNodeSize);
+        for (size_t idx = 0; idx < expressNodeSize; idx++) {
+            const auto &node = mCarrierConfig->mExpressNodes[idx];
+            expressNodeArray[idx].ipv4 = strdup(node->mIpv4->c_str());
+            expressNodeArray[idx].ipv6 = NULL;
+            expressNodeArray[idx].port = strdup(node->mPort->c_str());
+            expressNodeArray[idx].public_key = strdup(node->mPublicKey->c_str());
+        }
+        carrierOpts.express_nodes_size = expressNodeSize;
+        carrierOpts.express_nodes = expressNodeSize > 0 ? expressNodeArray.data() : nullptr;
+        mExpressSince = mDatabaseProxy->getOrInitMeta("express_since_us", getTimeStamp());
+        Log::I(TAG, "CarrierRobot::start express nodes=%zu express_since_us=%lld", expressNodeSize,
+               static_cast<long long>(mExpressSince));
         ela_log_init(static_cast<ElaLogLevel>(mCarrierConfig->mLogLevel), nullptr, nullptr);
 
         auto creater = [&]() -> ElaCarrier * {
