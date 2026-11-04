@@ -56,8 +56,10 @@ namespace chatrobot {
         bool closeDb();
         // A message from friend_id with exactly these bytes stored at or after since (us).
         bool hasMessageSince(const std::string &friend_id, const std::string &message, std::time_t since);
-        void addExpressBacklog(const std::string &friend_id, const std::string &message,
+        // True when stored; false when this (sender, post time, length) is already kept.
+        bool addExpressBacklog(const std::string &friend_id, const std::string &message,
                                std::time_t post_time, std::time_t recv_time);
+        void dedupeExpressBacklog();
         // service_meta[key], set to init_value the first time.
         std::time_t getOrInitMeta(const std::string &key, std::time_t init_value);
         std::shared_ptr<std::vector<std::shared_ptr<MessageInfo>>>

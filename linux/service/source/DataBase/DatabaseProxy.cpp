@@ -765,6 +765,7 @@ namespace chatrobot {
                    "SQLite service_meta statement execution error: %s\n", errMsg);
             return 1;
         }
+        dedupeExpressBacklog();
         //同步Member信息
         syncMemberList();
         syncGroupInfo();
@@ -823,22 +824,41 @@ namespace chatrobot {
         return found;
     }
 
-    void DatabaseProxy::addExpressBacklog(const std::string &friend_id, const std::string &message,
+    bool DatabaseProxy::addExpressBacklog(const std::string &friend_id, const std::string &message,
                                           std::time_t post_time, std::time_t recv_time) {
         MUTEX_LOCKER locker_sync_data(_SyncedMessageList);
         sqlite3_stmt *stmt = nullptr;
-        if (sqlite3_prepare_v2(mDb, "insert into express_backlog_table values(NULL, ?, ?, ?, ?);",
-                               -1, &stmt, nullptr) != SQLITE_OK) {
+        // Once per (sender, post time, length): the nodes re-deliver.
+        const char *sql = "insert into express_backlog_table (Friendid, Msg, PostTimeStamp, RecvTimeStamp)"
+                          " select ?1, ?2, ?3, ?4 where not exists (select 1 from express_backlog_table"
+                          " where Friendid=?1 and PostTimeStamp=?3 and length(Msg)=?5);";
+        if (sqlite3_prepare_v2(mDb, sql, -1, &stmt, nullptr) != SQLITE_OK) {
             Log::I(TAG, "addExpressBacklog prepare error: %s", sqlite3_errmsg(mDb));
-            return;
+            return false;
         }
         sqlite3_bind_text(stmt, 1, friend_id.data(), static_cast<int>(friend_id.size()), SQLITE_TRANSIENT);
         sqlite3_bind_blob(stmt, 2, message.data(), static_cast<int>(message.size()), SQLITE_TRANSIENT);
         sqlite3_bind_int64(stmt, 3, static_cast<sqlite3_int64>(post_time));
         sqlite3_bind_int64(stmt, 4, static_cast<sqlite3_int64>(recv_time));
+        sqlite3_bind_int64(stmt, 5, static_cast<sqlite3_int64>(message.size()));
+        bool inserted = false;
         if (sqlite3_step(stmt) != SQLITE_DONE) {
             Log::I(TAG, "addExpressBacklog step error: %s", sqlite3_errmsg(mDb));
+        } else {
+            inserted = sqlite3_changes(mDb) > 0;
         }
         sqlite3_finalize(stmt);
+        return inserted;
+    }
+
+    void DatabaseProxy::dedupeExpressBacklog() {
+        MUTEX_LOCKER locker_sync_data(_SyncedMessageList);
+        char *errMsg = NULL;
+        // Rows a build before this one stored on every re-delivery.
+        const char *sql = "delete from express_backlog_table where id not in (select min(id) from"
+                          " express_backlog_table group by Friendid, PostTimeStamp, length(Msg));";
+        if (sqlite3_exec(mDb, sql, callback, this, &errMsg) != SQLITE_OK) {
+            Log::I(TAG, "dedupeExpressBacklog error: %s", errMsg);
+        }
     }
 }

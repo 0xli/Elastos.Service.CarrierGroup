@@ -567,18 +567,23 @@ namespace chatrobot {
         // for node clocks): delivered weeks late into a busy group it would
         // only confuse. Kept in express_backlog_table, not relayed.
         if (posted > 0 && mExpressSince > 0 && posted < static_cast<int64_t>(mExpressSince) - 60 * kMinute) {
-            mDatabaseProxy->addExpressBacklog(friend_id, stored_form, static_cast<std::time_t>(posted), recv_time);
-            Log::I(TAG, "addMessgae express backlog kept, not relayed: from=%s len=%zu posted_us=%lld",
-                   friend_id.c_str(), stored_form.size(), static_cast<long long>(posted));
+            // The nodes hand the same message out again on every pull (11-03:
+            // the core's watermark never passes them), so keep it once.
+            if (mDatabaseProxy->addExpressBacklog(friend_id, stored_form, static_cast<std::time_t>(posted), recv_time)) {
+                Log::I(TAG, "addMessgae express backlog kept, not relayed: from=%s len=%zu posted_us=%lld",
+                       friend_id.c_str(), stored_form.size(), static_cast<long long>(posted));
+            }
             return false;
         }
         // The core re-sends a live message through Express when its receipt
-        // does not come back in 30 s, so a message can arrive twice. Same
-        // sender, same bytes, stored since 10 min before it was posted (or
-        // before now, whichever is earlier; at most a day back) = the copy
-        // we already have.
-        int64_t ref = posted > 0 ? std::min<int64_t>(posted, recv_time) : static_cast<int64_t>(recv_time);
-        int64_t since = std::max<int64_t>(ref - 10 * kMinute, static_cast<int64_t>(recv_time) - 24 * 60 * kMinute);
+        // does not come back in 30 s, so a message can arrive twice, and the
+        // nodes re-deliver the same parked message on every pull. Same
+        // sender, same bytes, stored since 10 min before it was posted = the
+        // copy we already have. The post time is fixed per message, so a
+        // re-delivery weeks later still matches. Without a post time: a day.
+        int64_t since = posted > 0
+                        ? std::min<int64_t>(posted, recv_time) - 10 * kMinute
+                        : static_cast<int64_t>(recv_time) - 24 * 60 * kMinute;
         if (mDatabaseProxy->hasMessageSince(friend_id, stored_form, static_cast<std::time_t>(since))) {
             Log::I(TAG, "addMessgae express duplicate dropped: from=%s len=%zu", friend_id.c_str(),
                    stored_form.size());

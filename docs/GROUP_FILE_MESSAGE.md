@@ -44,8 +44,13 @@ like a live one, text and file alike, with two exceptions:
 - **Duplicates.** The core re-sends a live message through Express when no
   receipt comes back in 30 s, so the same message can arrive twice. An Express
   copy is dropped when the same sender's identical bytes were stored from 10 min
-  before it was posted (at most 24 h back). A real repeat of the same text that
-  was parked in that window is dropped too; that is the trade-off.
+  before it was posted (24 h back when the node gives no post time). A real
+  repeat of the same text that was parked in that window is dropped too; that is
+  the trade-off. The same check absorbs re-deliveries: on 2026-11-03 the nodes
+  handed the same parked messages out on every pull (the core's per-node
+  watermark stayed below them, so nothing was deleted either); group 1 saw its
+  30 backlog messages about every 27 s. Backlog rows are kept once per
+  (sender, post time, length).
 - **Backlog.** Until 2026-11-03 the group never pulled Express, so up to 14 days
   of parked messages were waiting. Anything posted more than an hour before the
   group first pulled (`service_meta.express_since_us`) goes to
