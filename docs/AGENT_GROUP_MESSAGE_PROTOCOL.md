@@ -67,6 +67,11 @@ For recipients registered in `agent_table`, group service sends an envelope:
 
 Non-agent recipients continue receiving plain text.
 
+When the group message is a file (`[u32 metaLen][JSON][bytes]`, see
+`GROUP_FILE_MESSAGE.md`), the agent gets no bytes: `message.text` is
+`[file] <filename> (<n> bytes)` and `message.file` is
+`{"filename", "contentType", "size"}`. Human members get the file message itself.
+
 Notes:
 
 - `origin.user_info` and `origin.friend_info` come from Carrier `ElaFriendInfo` when available.

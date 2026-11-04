@@ -80,6 +80,16 @@ curl -sS http://127.0.0.1:5000/groups               # nicknames intact
 journalctl --user -u carriergroup.service | grep OnCarrierConnection
 ```
 
+End to end, with throwaway identities and a throwaway group only (never a real
+group): `linux/tools/cg_e2e.c` is a one-identity Carrier member that joins a
+group, sends files byte for byte as single messages and records what it receives
+(build line in its header). `docs/GROUP_FILE_MESSAGE.md` has the 2026-11-03 run.
+A new binary can be tried first on a second appserver instance that shares
+nothing with the live one: copy `server.py`, `chatrobot_restful_api.py`,
+`__init__.py`, `libcarrierManager.so` and the new `carrierService` to a scratch
+directory and run the venv python there with `--port 5099 --manager_port 3399
+--data_path <scratch>/rt` and `LD_LIBRARY_PATH=$CARRIER_LIB_DIR`.
+
 Keep a rollback ready: if the service is not active, or fewer processes than
 groups come up, restore the `.bak-*` binary and script, remove the drop-in,
 `daemon-reload` and restart. A first deploy of this branch did exactly that when

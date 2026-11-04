@@ -196,7 +196,13 @@ namespace chatrobot {
         }
 
         sqlite3_bind_text(stmt, 1, friend_id->c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 2, message.c_str(), -1, SQLITE_TRANSIENT);
+        // Exactly message.size() bytes. A payload with a 0x00 in it (a file
+        // message) is stored as a BLOB: TEXT with -1 stopped at the first NUL.
+        if (message.find('\0') == std::string::npos) {
+            sqlite3_bind_text(stmt, 2, message.data(), static_cast<int>(message.size()), SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_blob(stmt, 2, message.data(), static_cast<int>(message.size()), SQLITE_TRANSIENT);
+        }
         sqlite3_bind_int64(stmt, 3, static_cast<sqlite3_int64>(send_time));
 
         rv = sqlite3_step(stmt);
@@ -208,50 +214,47 @@ namespace chatrobot {
     std::shared_ptr<std::vector<std::shared_ptr<MessageInfo>>>
     DatabaseProxy::getMessages(std::shared_ptr<std::string> friend_id, std::time_t send_time, int max_limit) {
         MUTEX_LOCKER locker_sync_data(_SyncedMessageList);
-        //查询一条记录
-        char **azResult;   //二维数组存放结果
-        char *errMsg = NULL;
-        int nrow;          /* Number of result rows written here */
-        int ncolumn;
-        std::string t_strSql;
-        t_strSql = "select * from message_table where FriendId!='"+*friend_id.get()+"'";
-        t_strSql += " and SendTimeStamp>"+std::to_string(send_time);
-        t_strSql += " order by SendTimeStamp desc limit 0,"+std::to_string(max_limit)+";";
-        /*step 2: sql语句对象。*/
-        sqlite3_stmt *pStmt;
-        int rc = sqlite3_prepare_v2(
-                mDb, //数据库连接对象
-                t_strSql.c_str(), //指向原始sql语句字符串
-                strlen(t_strSql.c_str()), //
-                &pStmt,
-                NULL
-        );
-        if (rc != SQLITE_OK) {
-            Log::I(TAG, "sqlite3_prepare_v2 error:");
+        // Newest max_limit messages not from friend_id after send_time, returned
+        // oldest first. Read as bytes (column_blob/bytes), never as C strings,
+        // so file messages come back whole. kMaxBytes bounds one replay: once
+        // the newer messages fill it, older ones are left out, as messages
+        // past max_limit always were.
+        static const size_t kMaxBytes = 64u * 1024u * 1024u;
+        const char *sql = "select FriendId, Msg, SendTimeStamp from message_table"
+                          " where FriendId!=? and SendTimeStamp>?"
+                          " order by SendTimeStamp desc limit ?;";
+        sqlite3_stmt *pStmt = nullptr;
+        if (sqlite3_prepare_v2(mDb, sql, -1, &pStmt, nullptr) != SQLITE_OK) {
+            Log::I(TAG, "getMessages prepare error: %s", sqlite3_errmsg(mDb));
             return std::shared_ptr<std::vector<std::shared_ptr<MessageInfo>>>(nullptr);
         }
-
-        rc = sqlite3_get_table(mDb, t_strSql.c_str(), &azResult, &nrow, &ncolumn, &errMsg);
-        if (rc == SQLITE_OK) {
-            Log::I(TAG, "getMessages, successful sql:%s", t_strSql.c_str());
-        } else {
-            Log::I(TAG, "getMessages, Can't get table: %s", sqlite3_errmsg(mDb));
-            return std::shared_ptr<std::vector<std::shared_ptr<MessageInfo>>>(nullptr);
-        }
+        sqlite3_bind_text(pStmt, 1, friend_id->data(), static_cast<int>(friend_id->size()), SQLITE_TRANSIENT);
+        sqlite3_bind_int64(pStmt, 2, static_cast<sqlite3_int64>(send_time));
+        sqlite3_bind_int(pStmt, 3, max_limit);
 
         std::shared_ptr<std::vector<std::shared_ptr<MessageInfo>>> messages_list = std::make_shared<std::vector<std::shared_ptr<MessageInfo>>>();
-        if (nrow != 0 && ncolumn != 0) {     //有查询结果,不包含表头所占行数
-            for (int i = nrow; i >=1; i--) {        // 第0行为数据表头
-                std::shared_ptr<MessageInfo> message_info = std::make_shared<MessageInfo>();
-                message_info->mFriendid = std::make_shared<std::string>(azResult[4*i + 1]);
-                message_info->mMsg = std::make_shared<std::string>(azResult[4*i + 2]);
-                message_info->mSendTimeStamp = atol(azResult[4*i + 3]);
-                messages_list->push_back(message_info);
+        size_t total = 0;
+        int rc;
+        while ((rc = sqlite3_step(pStmt)) == SQLITE_ROW) {
+            const unsigned char *fid = sqlite3_column_text(pStmt, 0);
+            const void *msg = sqlite3_column_blob(pStmt, 1);
+            const int msg_len = sqlite3_column_bytes(pStmt, 1);
+            if (!messages_list->empty() && total + static_cast<size_t>(msg_len) > kMaxBytes) {
+                break;
             }
+            total += static_cast<size_t>(msg_len);
+            std::shared_ptr<MessageInfo> message_info = std::make_shared<MessageInfo>();
+            message_info->mFriendid = std::make_shared<std::string>(fid != nullptr ? (const char *) fid : "");
+            message_info->mMsg = std::make_shared<std::string>(
+                    msg != nullptr ? std::string(static_cast<const char *>(msg), msg_len) : std::string());
+            message_info->mSendTimeStamp = static_cast<std::time_t>(sqlite3_column_int64(pStmt, 2));
+            messages_list->push_back(message_info);
         }
-
-        sqlite3_free_table(azResult);
-        sqlite3_finalize(pStmt);     //销毁一个SQL语句对象
+        if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
+            Log::I(TAG, "getMessages step error: %s", sqlite3_errmsg(mDb));
+        }
+        sqlite3_finalize(pStmt);
+        std::reverse(messages_list->begin(), messages_list->end());
         return messages_list;
     }
 

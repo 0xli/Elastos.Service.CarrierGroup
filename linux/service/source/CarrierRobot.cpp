@@ -34,6 +34,93 @@ namespace chatrobot {
         constexpr const char *kAgentReplyPrefix = "CGR1 ";
         constexpr const char *kAgentStatusPrefix = "CGS1 ";
 
+        // File message (docs/GROUP_FILE_MESSAGE.md): one friend message
+        //   [u32 BE metaLen][meta JSON {"type":"file",...}][raw bytes]
+        // the same envelope clients send 1:1 to an offline friend. Binary: it
+        // must never pass through C-string handling or the "nick: text" wrap.
+        constexpr size_t kFileMetaMaxLen = 4096;
+        // Whole-message cap for what the group relays as a file: the core will
+        // not send more than this to a legacy-protocol member (Android, JS).
+        constexpr size_t kFileMessageMaxLen = CARRIER_LEGACY_MAX_APP_BULKMSG_LEN;
+
+        enum class FileMessageKind { NotFile, File, Invalid };
+
+        // Reader rules of the client spec (iOS ChatOfflineFileWire.unpack):
+        // metaLen 1..4096, meta is a JSON object with type "file", and a
+        // declared size must fit. Invalid = it claims to be a file message
+        // (two leading zero bytes, sane length) but is truncated/oversized.
+        FileMessageKind parseFileMessage(const std::string &raw, json *meta_out,
+                                         size_t *meta_len_out) {
+            if (raw.size() < 5
+                || raw[0] != '\0' || raw[1] != '\0') {
+                return FileMessageKind::NotFile;
+            }
+            const unsigned char *b = reinterpret_cast<const unsigned char *>(raw.data());
+            const size_t meta_len = (static_cast<size_t>(b[0]) << 24) | (static_cast<size_t>(b[1]) << 16)
+                                    | (static_cast<size_t>(b[2]) << 8) | static_cast<size_t>(b[3]);
+            if (meta_len < 1 || meta_len > kFileMetaMaxLen || 4 + meta_len > raw.size()) {
+                return FileMessageKind::NotFile;
+            }
+            json meta;
+            try {
+                meta = json::parse(raw.begin() + 4, raw.begin() + 4 + meta_len);
+            } catch (...) {
+                return FileMessageKind::NotFile;
+            }
+            if (!meta.is_object()) {
+                return FileMessageKind::NotFile;
+            }
+            auto type_it = meta.find("type");
+            if (type_it == meta.end() || !type_it->is_string() || type_it->get<std::string>() != "file") {
+                return FileMessageKind::NotFile;
+            }
+            auto size_it = meta.find("size");
+            if (size_it != meta.end() && size_it->is_number_unsigned()
+                && 4 + meta_len + size_it->get<uint64_t>() > raw.size()) {
+                return FileMessageKind::Invalid;
+            }
+            if (raw.size() > kFileMessageMaxLen) {
+                return FileMessageKind::Invalid;
+            }
+            if (meta_out != nullptr) {
+                *meta_out = std::move(meta);
+            }
+            if (meta_len_out != nullptr) {
+                *meta_len_out = meta_len;
+            }
+            return FileMessageKind::File;
+        }
+
+        // meta[key] if it is a string, else fallback. json::value() throws on a
+        // non-string value, and the relay runs inside a Carrier callback.
+        std::string metaString(const json &meta, const char *key, const std::string &fallback) {
+            auto it = meta.find(key);
+            return it != meta.end() && it->is_string() ? it->get<std::string>() : fallback;
+        }
+
+        // A DNFT1 streamed-transfer frame (0x1E "DNFT1"). It is a 1:1
+        // handshake that needs the receiver to answer; relayed into a group it
+        // only ever became junk text for every member (2026-10-09).
+        bool isDnft1Frame(const std::string &raw) {
+            return raw.size() >= 6 && raw[0] == '\x1e' && raw.compare(1, 5, "DNFT1") == 0;
+        }
+
+        // [u32 BE len(meta_str)][meta_str][the file bytes of raw, after its own meta]
+        std::string packFileMessage(const std::string &meta_str, const std::string &raw,
+                                    size_t old_meta_len) {
+            const size_t body_off = 4 + old_meta_len;
+            std::string out;
+            out.reserve(4 + meta_str.size() + raw.size() - body_off);
+            const uint32_t n = static_cast<uint32_t>(meta_str.size());
+            out.push_back(static_cast<char>((n >> 24) & 0xff));
+            out.push_back(static_cast<char>((n >> 16) & 0xff));
+            out.push_back(static_cast<char>((n >> 8) & 0xff));
+            out.push_back(static_cast<char>(n & 0xff));
+            out.append(meta_str);
+            out.append(raw, body_off, std::string::npos);
+            return out;
+        }
+
         // Carrier profile and message data is supplied by remote peers.  Do not
         // let a malformed byte sequence from one peer terminate the whole group
         // service while serializing a relay envelope.
@@ -423,16 +510,25 @@ namespace chatrobot {
                         }
                         int msg_ret = ela_send_friend_message_noreceipt(mCarrier.get(),
                                                               memberInfo->mFriendid.get()->c_str(),
-                                                              msg.c_str(), msg.size());
+                                                              msg.data(), msg.size());
                         if (msg_ret != 0) {
+                            const int err = ela_get_error();
                             Log::I(TAG,
-                                   "relayMessages send failed to=%s from=%s ts=%lld err=0x%x",
+                                   "relayMessages send failed to=%s from=%s ts=%lld len=%zu err=0x%x",
                                    memberInfo->mFriendid.get() != nullptr
                                    ? memberInfo->mFriendid->c_str() : "",
                                    message->mFriendid.get() != nullptr
                                    ? message->mFriendid->c_str() : "",
                                    static_cast<long long>(message->mSendTimeStamp),
-                                   ela_get_error());
+                                   msg.size(), err);
+                            if (err == CARRIER_GENERAL_ERROR(ERROR_INVALID_ARGS)) {
+                                // Permanent for this member (e.g. over a legacy
+                                // peer's 5 MB cap): skip it, or the member is
+                                // stuck behind this message forever.
+                                info_changed = true;
+                                memberInfo->mMsgTimeStamp = message->mSendTimeStamp;
+                                continue;
+                            }
                             break;
                         }
                         info_changed = true;
@@ -452,6 +548,26 @@ namespace chatrobot {
     void CarrierRobot::addMessgae(std::shared_ptr<std::string> friend_id,
                                   std::shared_ptr<std::string> message, std::time_t send_time) {
         std::string errMsg;
+        if (isDnft1Frame(*message.get())) {
+            Log::I(TAG, "addMessgae drop DNFT1 frame from=%s len=%zu", friend_id->c_str(),
+                   message->size());
+            return;
+        }
+        switch (parseFileMessage(*message.get(), nullptr, nullptr)) {
+            case FileMessageKind::File:
+                // Stored and relayed byte for byte; never a command or agent reply.
+                Log::I(TAG, "addMessgae file message from=%s len=%zu", friend_id->c_str(),
+                       message->size());
+                mDatabaseProxy->addMessgae(friend_id, *message.get(), send_time);
+                relayMessages();
+                return;
+            case FileMessageKind::Invalid:
+                Log::I(TAG, "addMessgae drop truncated/oversized file message from=%s len=%zu",
+                       friend_id->c_str(), message->size());
+                return;
+            case FileMessageKind::NotFile:
+                break;
+        }
         std::string msg = normalizeIncomingMessageForStorage(*friend_id.get(), *message.get());
         std::string status_message = normalizeAgentStatusEnvelope(*friend_id.get(), *message.get());
         if (!status_message.empty()) {
@@ -480,12 +596,15 @@ namespace chatrobot {
                                               const void *msg, size_t len,
                                               int64_t timestamp, bool offline,
                                               void *context) {
-        Log::I(Log::TAG, "OnCarrierFriendMessage from: %s len=%d", from, len);
+        Log::I(Log::TAG, "OnCarrierFriendMessage from: %s len=%zu", from, len);
         auto carrier_robot = reinterpret_cast<CarrierRobot *>(context);
         // Carrier payloads are not NUL-terminated; take exactly len bytes and drop trailing NULs
-        // (fix carried on the live box since 2026-09-14, folded in here).
+        // (fix carried on the live box since 2026-09-14, folded in here). A file message is
+        // binary and may legitimately end in 0x00, so it is kept as is.
         std::string text((const char *) msg, len);
-        while (!text.empty() && text.back() == '\0') text.pop_back();
+        if (parseFileMessage(text, nullptr, nullptr) == FileMessageKind::NotFile) {
+            while (!text.empty() && text.back() == '\0') text.pop_back();
+        }
         std::time_t send_time = carrier_robot->getTimeStamp();
         carrier_robot->addMessgae(std::make_shared<std::string>(from),
                                   std::make_shared<std::string>(text),
@@ -717,7 +836,7 @@ namespace chatrobot {
 
     void CarrierRobot::sendCommandResponse(const std::string &friend_id, const std::string &message) {
         int ela_ret = ela_send_friend_message_noreceipt(mCarrier.get(), friend_id.c_str(),
-                                              message.c_str(), strlen(message.c_str()));
+                                              message.data(), message.size());
         if (ela_ret != 0) {
             Log::I(Log::TAG,
                    "sendCommandResponse .c_str(): %s errno:(0x%x)",
@@ -1022,8 +1141,8 @@ namespace chatrobot {
 
             int ela_ret = ela_send_friend_message_noreceipt(mCarrier.get(),
                                                   member_friend_id.c_str(),
-                                                  status_message.c_str(),
-                                                  strlen(status_message.c_str()));
+                                                  status_message.data(),
+                                                  status_message.size());
             if (ela_ret != 0) {
                 Log::I(Log::TAG,
                        "relayAgentStatusToMembers failed: to=%s errno=(0x%x)",
@@ -1063,9 +1182,52 @@ namespace chatrobot {
             sender_member_info->UnLock();
         }
 
-        std::string plain_text = sender_nickname + ": " + *message->mMsg.get()
+        json file_meta;
+        size_t file_meta_len = 0;
+        const bool is_file = parseFileMessage(*message->mMsg.get(), &file_meta, &file_meta_len)
+                             == FileMessageKind::File;
+        const bool to_agent = mDatabaseProxy->hasAgent(recipient_user_id);
+
+        std::string group_user_id;
+        getUserId(group_user_id);
+        std::shared_ptr<std::string> group_nickname_ptr = mDatabaseProxy->getGroupNickName();
+        const std::string group_nickname = group_nickname_ptr.get() != nullptr ? *group_nickname_ptr.get() : "";
+
+        if (is_file && !to_agent) {
+            // Same envelope the member sent, with the real sender added to the
+            // meta (readers ignore keys they do not know). Whatever the sender
+            // put under these keys is replaced, so it cannot spoof another member.
+            static const char *kRelayKeys[] = {"chat_type", "group", "origin", "sent_at_ms"};
+            for (const char *key : kRelayKeys) {
+                file_meta.erase(key);
+            }
+            json relay_meta = file_meta;
+            relay_meta["chat_type"] = "group";
+            relay_meta["group"]["userid"] = group_user_id;
+            relay_meta["group"]["address"] = mAddress;
+            relay_meta["group"]["nickname"] = group_nickname;
+            relay_meta["origin"]["userid"] = sender_user_id;
+            relay_meta["origin"]["nickname"] = sender_nickname;
+            relay_meta["sent_at_ms"] = static_cast<long long>(message->mSendTimeStamp / 1000);
+            const size_t body_len = message->mMsg->size() - 4 - file_meta_len;
+            std::string meta_str = dumpJsonForTransport(relay_meta);
+            if (meta_str.size() > kFileMetaMaxLen
+                || 4 + meta_str.size() + body_len > kFileMessageMaxLen) {
+                // No room for the sender fields: relay the file without them.
+                meta_str = dumpJsonForTransport(file_meta);
+            }
+            return packFileMessage(meta_str, *message->mMsg.get(), file_meta_len);
+        }
+
+        std::string body_text = *message->mMsg.get();
+        if (is_file) {
+            const std::string filename = metaString(file_meta, "filename", "file");
+            body_text = std::string("[file] ") + filename + " ("
+                        + std::to_string(message->mMsg->size() - 4 - file_meta_len) + " bytes)";
+        }
+        std::string plain_text = sender_nickname + ": " + body_text
                                  + " \n[" + this->convertDatetimeToString(message->mSendTimeStamp) + "]";
-        if (!mDatabaseProxy->hasAgent(recipient_user_id)) {
+        if (!to_agent) {
             return plain_text;
         }
 
@@ -1075,12 +1237,10 @@ namespace chatrobot {
         envelope["chat_type"] = "group";
         envelope["source"] = "carrier_group_service";
         envelope["group"]["address"] = mAddress;
-        std::string group_user_id;
-        if (getUserId(group_user_id) == 0) {
+        if (!group_user_id.empty()) {
             envelope["group"]["userid"] = group_user_id;
         }
-        std::shared_ptr<std::string> group_nickname = mDatabaseProxy->getGroupNickName();
-        envelope["group"]["nickname"] = group_nickname.get() != nullptr ? *group_nickname.get() : "";
+        envelope["group"]["nickname"] = group_nickname;
         envelope["origin"]["userid"] = sender_user_id;
         envelope["origin"]["friendid"] = sender_user_id;
         envelope["origin"]["nickname"] = sender_nickname;
@@ -1111,7 +1271,15 @@ namespace chatrobot {
             envelope["origin"]["friend_info"]["presence"] = static_cast<int>(ElaPresenceStatus_None);
             envelope["origin"]["friend_info"]["presence_text"] = presenceStatusToString(ElaPresenceStatus_None);
         }
-        envelope["message"]["text"] = *message->mMsg.get();
+        envelope["message"]["text"] = body_text;
+        if (is_file) {
+            // Agents get the file's description, not its bytes.
+            envelope["message"]["file"]["filename"] = metaString(file_meta, "filename", "file");
+            envelope["message"]["file"]["contentType"] =
+                    metaString(file_meta, "contentType", "application/octet-stream");
+            envelope["message"]["file"]["size"] =
+                    static_cast<unsigned long long>(message->mMsg->size() - 4 - file_meta_len);
+        }
         envelope["message"]["timestamp"] = static_cast<long long>(message->mSendTimeStamp);
         envelope["render"]["plain"] = plain_text;
         return std::string(kAgentOutboundPrefix) + dumpJsonForTransport(envelope);
@@ -1126,7 +1294,7 @@ namespace chatrobot {
         if (args.size() >= 2) {
             const std::string friend_id = args[1];
             int ela_ret = ela_send_friend_message_noreceipt(mCarrier.get(), friend_id.c_str(),
-                                                  message.c_str(), strlen(message.c_str()));
+                                                  message.data(), message.size());
             if (ela_ret != 0) {
                 Log::I(Log::TAG,
                        "helpCmd .c_str(): %s errno:(0x%x)",
@@ -1155,8 +1323,8 @@ namespace chatrobot {
             }
 
             int ela_ret = ela_send_friend_message_noreceipt(mCarrier.get(), friend_id.c_str(),
-                                                  ret_msg_str.c_str(),
-                                                  strlen(ret_msg_str.c_str()));
+                                                  ret_msg_str.data(),
+                                                  ret_msg_str.size());
             if (ela_ret != 0) {
                 Log::I(Log::TAG,
                        "listCmd .c_str(): %s errno:(0x%x)",
@@ -1316,7 +1484,7 @@ namespace chatrobot {
 
             const std::string friend_id = args[1];
             int ela_ret = ela_send_friend_message_noreceipt(mCarrier.get(), friend_id.c_str(),
-                                                  address.c_str(), strlen(address.c_str()));
+                                                  address.data(), address.size());
             if (ela_ret != 0) {
                 Log::I(Log::TAG,
                        "showAddressCmd .c_str(): %s errno:(0x%x)",
