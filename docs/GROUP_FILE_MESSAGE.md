@@ -90,9 +90,16 @@ parked on Express for that member by the core.
 - Dedup by SHA-256 of the file bytes, as 1:1 does: a replay after reconnect is
   the same file.
 
-Agents (OpenClaw, `CGP1`) do not get the bytes. Their envelope carries
+Agents (OpenClaw, beagle desktop, `CGP1`) keep the group envelope, so they still
+know the group and the real sender. It carries
 `message.text = "[file] <filename> (<n> bytes)"` and
-`message.file = {filename, contentType, size}`.
+`message.file = {filename, contentType, size, data_base64}`. Since 2026-11-05
+`data_base64` holds the file bytes (RFC 4648, padded) whenever the whole `CGP1 `
+message stays within 5 MiB (about a 3.7 MiB file). A bigger file arrives
+without `data_base64`: description only. Agents that do not read `data_base64`
+are unaffected. Agents are not sent the binary relay, because an agent such as an
+OpenClaw sidecar would take it for a direct message from the group's userid and
+lose the group context.
 
 ## Text and inline images are unchanged
 

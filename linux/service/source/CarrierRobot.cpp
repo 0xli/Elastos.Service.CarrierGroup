@@ -45,6 +45,35 @@ namespace chatrobot {
 
         enum class FileMessageKind { NotFile, File, Invalid };
 
+        // Standard base64 (RFC 4648, with padding) for the file bytes an agent
+        // gets inside its CGP1 envelope (message.file.data_base64).
+        std::string base64Encode(const char *data, size_t len) {
+            static const char kAlphabet[] =
+                    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            const unsigned char *b = reinterpret_cast<const unsigned char *>(data);
+            std::string out;
+            out.reserve(((len + 2) / 3) * 4);
+            size_t i = 0;
+            for (; i + 2 < len; i += 3) {
+                const unsigned int v = (b[i] << 16) | (b[i + 1] << 8) | b[i + 2];
+                out.push_back(kAlphabet[(v >> 18) & 0x3F]);
+                out.push_back(kAlphabet[(v >> 12) & 0x3F]);
+                out.push_back(kAlphabet[(v >> 6) & 0x3F]);
+                out.push_back(kAlphabet[v & 0x3F]);
+            }
+            if (i < len) {
+                unsigned int v = b[i] << 16;
+                if (i + 1 < len) {
+                    v |= b[i + 1] << 8;
+                }
+                out.push_back(kAlphabet[(v >> 18) & 0x3F]);
+                out.push_back(kAlphabet[(v >> 12) & 0x3F]);
+                out.push_back(i + 1 < len ? kAlphabet[(v >> 6) & 0x3F] : '=');
+                out.push_back('=');
+            }
+            return out;
+        }
+
         // Reader rules of the client spec (iOS ChatOfflineFileWire.unpack):
         // metaLen 1..4096, meta is a JSON object with type "file", and a
         // declared size must fit. Invalid = it claims to be a file message
@@ -1344,7 +1373,9 @@ namespace chatrobot {
         }
         envelope["message"]["text"] = body_text;
         if (is_file) {
-            // Agents get the file's description, not its bytes.
+            // Agents keep the group envelope (group + real sender) and get the
+            // bytes inside it as base64 when they fit; agents that do not know
+            // data_base64 ignore it and still see the description.
             envelope["message"]["file"]["filename"] = metaString(file_meta, "filename", "file");
             envelope["message"]["file"]["contentType"] =
                     metaString(file_meta, "contentType", "application/octet-stream");
@@ -1353,6 +1384,20 @@ namespace chatrobot {
         }
         envelope["message"]["timestamp"] = static_cast<long long>(message->mSendTimeStamp);
         envelope["render"]["plain"] = plain_text;
+        if (is_file) {
+            const size_t body_offset = 4 + file_meta_len;
+            const size_t body_len = message->mMsg->size() - body_offset;
+            // Cheap pre-check before encoding: base64 is 4/3 of the bytes.
+            if (((body_len + 2) / 3) * 4 + 4096 < kFileMessageMaxLen) {
+                envelope["message"]["file"]["data_base64"] =
+                        base64Encode(message->mMsg->data() + body_offset, body_len);
+                std::string with_data = std::string(kAgentOutboundPrefix) + dumpJsonForTransport(envelope);
+                if (with_data.size() <= kFileMessageMaxLen) {
+                    return with_data;
+                }
+                envelope["message"]["file"].erase("data_base64");
+            }
+        }
         return std::string(kAgentOutboundPrefix) + dumpJsonForTransport(envelope);
     }
 
